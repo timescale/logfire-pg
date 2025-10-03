@@ -28,16 +28,18 @@ type QueryResponse struct {
 }
 
 func main() {
+	var port int
+	flag.StringVar(&readToken, "token", "", "Logfire read token")
+	flag.IntVar(&port, "port", 5432, "Port to listen on")
 	flag.Parse()
 
-	if len(flag.Args()) < 1 {
-		log.Fatal("Usage: pg_logfire <token>")
+	if readToken == "" {
+		log.Fatal("Error: -token flag is required and cannot be blank")
 	}
 
-	readToken = flag.Args()[0]
 	fmt.Println("Starting pg_logfire...")
 	fmt.Println("Using read token:", readToken)
-	wire.ListenAndServe("127.0.0.1:5432", handler)
+	wire.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port), handler)
 }
 
 func handler(ctx context.Context, query string) (wire.PreparedStatements, error) {
