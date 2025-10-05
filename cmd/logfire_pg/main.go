@@ -107,6 +107,8 @@ func arrowTypeToPgOid(dt arrow.DataType) (oid.Oid, error) {
 		return oid.T_int4, nil
 	case arrow.UINT32:
 		return oid.T_int8, nil
+	case arrow.UINT64:
+		return oid.T_int8, nil
 	case arrow.FLOAT64:
 		return oid.T_float8, nil
 	case arrow.DATE32:
@@ -158,6 +160,8 @@ func arrowValueToInterface(col arrow.Array, rowIdx int) (interface{}, error) {
 	case *array.Uint16:
 		return float64(arr.Value(rowIdx)), nil
 	case *array.Uint32:
+		return float64(arr.Value(rowIdx)), nil
+	case *array.Uint64:
 		return float64(arr.Value(rowIdx)), nil
 	case *array.Float64:
 		return arr.Value(rowIdx), nil
