@@ -53,7 +53,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	logger := log.New(os.Stdout, "[psql-wire] ", log.LstdFlags)
+	logger := log.New(os.Stdout, "[logfire-pg] ", log.LstdFlags)
 	server, err := NewPostgreServer(logger)
 	if err != nil {
 		logger.Fatalf("failed to create server: %s", err)
