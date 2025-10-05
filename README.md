@@ -32,9 +32,10 @@ For the full available options on running the server, see `--help`:
 
 ```text
 Usage of ./bin/logfire_pg:
-      --help       Print this help message and exit
-      --port int   Port to listen on (default 5432)
-      --version    Print version and exit
+      --help          Print this help message and exit
+      --host string   Host to listen on (default "127.0.0.1")
+      --port int      Port to listen on (default 5432)
+      --version       Print version and exit
 ```
 
 ## Development

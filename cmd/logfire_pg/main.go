@@ -32,10 +32,12 @@ type PostgreServer struct {
 type readTokenCtxKey struct{}
 
 func main() {
+	var host string
 	var port int
 	var showVersion bool
 	var showHelp bool
 
+	flag.StringVar(&host, "host", "127.0.0.1", "Host to listen on")
 	flag.IntVar(&port, "port", 5432, "Port to listen on")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.BoolVar(&showHelp, "help", false, "Print this help message and exit")
@@ -58,7 +60,7 @@ func main() {
 	}
 
 	fmt.Println("Starting pg_logfire...")
-	err = server.server.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port))
+	err = server.server.ListenAndServe(fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
 		logger.Fatalf("failed to start server: %s", err)
 	}
