@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/ipc"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
@@ -24,17 +27,6 @@ var queryUrl = baseURL + "/v1/query"
 type PostgreServer struct {
 	server *wire.Server
 	logger *log.Logger
-}
-
-type Column struct {
-	Name     string        `json:"name"`
-	Datatype interface{}   `json:"datatype"`
-	Nullable bool          `json:"nullable"`
-	Values   []interface{} `json:"values"`
-}
-
-type QueryResponse struct {
-	Columns []Column `json:"columns"`
 }
 
 type readTokenCtxKey struct{}
@@ -72,13 +64,14 @@ func main() {
 	}
 }
 
-func executeQuery(sql string, token string) (*QueryResponse, error) {
+func executeQuery(sql string, token string) (io.ReadCloser, error) {
 	req, err := http.NewRequest("GET", queryUrl, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.apache.arrow.stream")
 
 	q := req.URL.Query()
 	q.Add("sql", sql)
@@ -89,20 +82,108 @@ func executeQuery(sql string, token string) (*QueryResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		return nil, fmt.Errorf("query failed. Status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse the JSON response
-	var queryResp QueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	// Return the response body as a stream
+	return resp.Body, nil
+}
+
+func arrowTypeToPgOid(dt arrow.DataType) (oid.Oid, error) {
+	switch dt.ID() {
+	case arrow.STRING, arrow.LARGE_STRING:
+		return oid.T_text, nil
+	case arrow.BOOL:
+		return oid.T_bool, nil
+	case arrow.INT32:
+		return oid.T_int4, nil
+	case arrow.INT64:
+		return oid.T_int8, nil
+	case arrow.UINT16:
+		return oid.T_int4, nil
+	case arrow.UINT32:
+		return oid.T_int8, nil
+	case arrow.FLOAT64:
+		return oid.T_float8, nil
+	case arrow.DATE32:
+		return oid.T_date, nil
+	case arrow.TIMESTAMP:
+		return oid.T_timestamptz, nil
+	case arrow.LIST:
+		listType := dt.(*arrow.ListType)
+		innerOid, err := arrowTypeToPgOid(listType.Elem())
+		if err != nil {
+			return 0, err
+		}
+		// Convert to array OID (add underscore prefix)
+		switch innerOid {
+		case oid.T_text:
+			return oid.T__text, nil
+		case oid.T_bool:
+			return oid.T__bool, nil
+		case oid.T_int4:
+			return oid.T__int4, nil
+		case oid.T_int8:
+			return oid.T__int8, nil
+		case oid.T_float8:
+			return oid.T__float8, nil
+		case oid.T_date:
+			return oid.T__date, nil
+		default:
+			return 0, fmt.Errorf("unsupported list inner type: %v", innerOid)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported arrow type: %v", dt)
+	}
+}
+
+func arrowValueToInterface(col arrow.Array, rowIdx int) (interface{}, error) {
+	if col.IsNull(rowIdx) {
+		return nil, nil
 	}
 
-	return &queryResp, nil
+	switch arr := col.(type) {
+	case *array.String:
+		return arr.Value(rowIdx), nil
+	case *array.Boolean:
+		return arr.Value(rowIdx), nil
+	case *array.Int32:
+		return float64(arr.Value(rowIdx)), nil
+	case *array.Int64:
+		return float64(arr.Value(rowIdx)), nil
+	case *array.Uint16:
+		return float64(arr.Value(rowIdx)), nil
+	case *array.Uint32:
+		return float64(arr.Value(rowIdx)), nil
+	case *array.Float64:
+		return arr.Value(rowIdx), nil
+	case *array.Date32:
+		return arr.Value(rowIdx).FormattedString(), nil
+	case *array.Timestamp:
+		return arr.Value(rowIdx).ToTime(arrow.Microsecond).Format("2006-01-02T15:04:05.000000Z"), nil
+	case *array.List:
+		listValues := make([]interface{}, 0)
+		start, end := arr.ValueOffsets(rowIdx)
+		innerArray := arr.ListValues()
+
+		for j := range int(end) - int(start) {
+			val, err := arrowValueToInterface(innerArray, int(start)+j)
+			if err != nil {
+				return nil, err
+			}
+			listValues = append(listValues, val)
+		}
+
+		// Convert to JSON string for PostgreSQL array representation
+		jsonBytes, _ := json.Marshal(listValues)
+		return string(jsonBytes), nil
+	default:
+		return nil, fmt.Errorf("unsupported arrow type: %T", arr)
+	}
 }
 
 func NewPostgreServer(logger *log.Logger) (*PostgreServer, error) {
@@ -130,28 +211,12 @@ func (s *PostgreServer) auth(ctx context.Context, database, username, password s
 	}
 
 	// Validate password by making API call to logfire
-	queryResp, err := executeQuery("SELECT 1", password)
+	respBody, err := executeQuery("SELECT 1", password)
 	if err != nil {
 		return ctx, false, fmt.Errorf("authentication failed: %w", err)
 	}
-
-	// Validate response structure
-	if len(queryResp.Columns) != 1 {
-		return ctx, false, fmt.Errorf("expected 1 column, got %d", len(queryResp.Columns))
-	}
-
-	if len(queryResp.Columns[0].Values) != 1 {
-		return ctx, false, fmt.Errorf("expected 1 value, got %d", len(queryResp.Columns[0].Values))
-	}
-
-	// Check if the value is 1
-	v, ok := queryResp.Columns[0].Values[0].(float64)
-	if !ok {
-		return ctx, false, fmt.Errorf("expected integer value, got %v (type %T)", queryResp.Columns[0].Values[0], queryResp.Columns[0].Values[0])
-	}
-	if v != 1.0 {
-		return ctx, false, fmt.Errorf("expected value 1, got %v", v)
-	}
+	// Close immediately as we just need to verify the token works
+	respBody.Close()
 
 	ctx = context.WithValue(ctx, readTokenCtxKey{}, password)
 
@@ -176,140 +241,78 @@ func (s *PostgreServer) wireHandler(ctx context.Context, query string) (wire.Pre
 	s.logger.Printf("incoming SQL query: %s", query)
 
 	readToken := ctx.Value(readTokenCtxKey{}).(string)
-	queryResp, err := executeQuery(query, readToken)
+	respBody, err := executeQuery(query, readToken)
 	if err != nil {
 		s.logger.Printf("query execution error: %v", err)
 		return nil, psqlerr.WithSeverity(psqlerr.WithCode(err, codes.SyntaxErrorOrAccessRuleViolation), psqlerr.LevelFatal)
 	}
 
+	// Create Arrow IPC reader from the response stream
+	reader, err := ipc.NewReader(respBody)
+	if err != nil {
+		respBody.Close()
+		s.logger.Printf("failed to create arrow reader: %v", err)
+		return nil, psqlerr.WithSeverity(psqlerr.WithCode(err, codes.DataException), psqlerr.LevelFatal)
+	}
+
+	// Extract column information from schema
+	schema := reader.Schema()
 	var columns wire.Columns
-	for _, col := range queryResp.Columns {
-		pgOid, err := arrowTypeToPgOid(col.Name, col.Datatype)
+	for _, field := range schema.Fields() {
+		pgOid, err := arrowTypeToPgOid(field.Type)
 		if err != nil {
-			s.logger.Printf("type mapping error: %v", err)
+			reader.Release()
+			respBody.Close()
+			s.logger.Printf("type mapping error for column %s: %v", field.Name, err)
 			return nil, psqlerr.WithSeverity(psqlerr.WithCode(err, codes.DatatypeMismatch), psqlerr.LevelFatal)
 		}
 
 		columns = append(columns, wire.Column{
 			Table: 0,
-			Name:  col.Name,
+			Name:  field.Name,
 			Oid:   pgOid,
 			Width: 256,
 		})
 	}
 
-	numRows := 0
-	if len(queryResp.Columns) > 0 {
-		numRows = len(queryResp.Columns[0].Values)
-	}
-
-	// Build the columns dynamically
+	// Build the handler that streams rows from Arrow batches
 	handle := func(ctx context.Context, writer wire.DataWriter, parameters []wire.Parameter) error {
-		// Write each row
-		for i := 0; i < numRows; i++ {
-			row := make([]any, len(queryResp.Columns))
-			for j, col := range queryResp.Columns {
-				val := col.Values[i]
-				// Convert to string if not already
-				if str, ok := val.(string); ok {
-					row[j] = str
-				} else if val == nil {
-					row[j] = nil
-				} else {
-					// For numbers, bools, or JSON objects, marshal to string
-					jsonBytes, _ := json.Marshal(val)
-					row[j] = string(jsonBytes)
+		defer reader.Release()
+		defer respBody.Close()
+
+		totalRows := 0
+
+		// Stream through all record batches
+		for reader.Next() {
+			record := reader.Record()
+			numRows := int(record.NumRows())
+			numCols := int(record.NumCols())
+
+			// Process each row in the batch
+			for i := range numRows {
+				row := make([]any, numCols)
+
+				// Extract values for each column
+				for j := range numCols {
+					col := record.Column(j)
+					val, err := arrowValueToInterface(col, i)
+					if err != nil {
+						return fmt.Errorf("failed to convert column %d row %d: %w", j, i, err)
+					}
+					row[j] = val
 				}
+
+				writer.Row(row)
+				totalRows++
 			}
-			writer.Row(row)
 		}
-		return writer.Complete(fmt.Sprintf("SELECT %d", numRows))
+
+		if err := reader.Err(); err != nil {
+			return fmt.Errorf("error reading arrow stream: %w", err)
+		}
+
+		return writer.Complete(fmt.Sprintf("SELECT %d", totalRows))
 	}
 
 	return wire.Prepared(wire.NewStatement(handle, wire.WithColumns(columns))), nil
-}
-
-// arrowTypeToPgOid maps Arrow data types to PostgreSQL OID types
-func arrowTypeToPgOid(columnName string, datatype interface{}) (oid.Oid, error) {
-	// Handle simple string types
-	if typeStr, ok := datatype.(string); ok {
-		switch typeStr {
-		case "Utf8":
-			return oid.T_text, nil
-		case "JSON":
-			return oid.T_json, nil
-		case "Boolean":
-			return oid.T_bool, nil
-		case "Int32":
-			return oid.T_int4, nil
-		case "Int64":
-			return oid.T_int8, nil
-		case "UInt16":
-			return oid.T_int4, nil
-		case "UInt32":
-			return oid.T_int8, nil
-		case "Float64":
-			return oid.T_float8, nil
-		case "Date32":
-			return oid.T_date, nil
-		default:
-			return 0, fmt.Errorf("column '%s' has unsupported datatype: %s", columnName, typeStr)
-		}
-	}
-
-	// Handle complex types (maps and arrays)
-	if typeMap, ok := datatype.(map[string]interface{}); ok {
-		// Check for List type: {"List": {"name": "item", "datatype": "Utf8", "nullable": true}}
-		if listDef, hasListKey := typeMap["List"]; hasListKey {
-			// Extract the inner datatype from the List definition
-			if listMap, ok := listDef.(map[string]interface{}); ok {
-				if innerType, ok := listMap["datatype"].(string); ok {
-					switch innerType {
-					case "Utf8":
-						return oid.T__text, nil
-					case "JSON":
-						return oid.T__json, nil
-					case "Boolean":
-						return oid.T__bool, nil
-					case "Int32":
-						return oid.T__int4, nil
-					case "Int64":
-						return oid.T__int8, nil
-					case "UInt16":
-						return oid.T__int4, nil
-					case "UInt32":
-						return oid.T__int8, nil
-					case "Float64":
-						return oid.T__float8, nil
-					case "Date32":
-						return oid.T__date, nil
-					default:
-						return 0, fmt.Errorf("column '%s' has unsupported List inner datatype: %s", columnName, innerType)
-					}
-				}
-			}
-			return 0, fmt.Errorf("column '%s' has invalid List definition: %v", columnName, listDef)
-		}
-
-		// Check for Timestamp type: {"Timestamp": ["Microsecond", "UTC"]}
-		if _, hasTimestampKey := typeMap["Timestamp"]; hasTimestampKey {
-			// Map Arrow Timestamp to PostgreSQL timestamptz
-			return oid.T_timestamptz, nil
-		}
-
-		return 0, fmt.Errorf("column '%s' has unsupported complex datatype: %v", columnName, typeMap)
-	}
-
-	// Handle array types (for Timestamp: ["Microsecond", "UTC"])
-	if typeArr, ok := datatype.([]interface{}); ok {
-		if len(typeArr) >= 2 {
-			if first, ok := typeArr[0].(string); ok && first == "Microsecond" {
-				// This is a Timestamp type
-				return oid.T_timestamptz, nil
-			}
-		}
-		return 0, fmt.Errorf("column '%s' has unsupported array datatype: %v", columnName, typeArr)
-	}
-
-	return 0, fmt.Errorf("column '%s' has invalid datatype format: expected string, map, or array, got %T", columnName, datatype)
 }
