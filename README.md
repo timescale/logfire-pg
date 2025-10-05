@@ -4,8 +4,10 @@ A wrapper around the [Logfire](https://pydantic.dev/logfire) API, exposing it as
 
 ## Installation
 
-Go to the [Releases](https://github.com/timescale/logfire-pg/releases) page and download the binary
-for your system. Place the binary onto somewhere in your PATH.
+For Linux and Windows, go to the [Releases](https://github.com/timescale/logfire-pg/releases) page
+and download the binary for your system. Place the binary onto somewhere in your PATH.
+
+For macOS, you will need to clone the repo and build from source.
 
 ## Usage
 
