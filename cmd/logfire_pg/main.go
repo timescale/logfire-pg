@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -64,6 +66,37 @@ func main() {
 	if err != nil {
 		logger.Fatalf("failed to start server: %s", err)
 	}
+}
+
+func DetectPsqlCommandQuery(query string) (detectedCommand string, suggestedQuery string, isPsqlCommand bool) {
+	// Normalize whitespace for comparison
+	normalized := strings.Join(strings.Fields(query), " ")
+
+	// Check for \dt command pattern
+	dtPattern := `SELECT n.nspname as "Schema", c.relname as "Name", CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as "Type", pg_catalog.pg_get_userbyid(c.relowner) as "Owner" FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam WHERE c.relkind IN ('r','p','') AND n.nspname <> 'pg_catalog' AND n.nspname !~ '^pg_toast' AND n.nspname <> 'information_schema' AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 1,2;`
+
+	if normalized == dtPattern {
+		return "\\dt", "show tables;", true
+	}
+
+	// Check for \d <table> command pattern (without schema)
+	dPattern := regexp.MustCompile(`^SELECT c\.oid, n\.nspname, c\.relname FROM pg_catalog\.pg_class c LEFT JOIN pg_catalog\.pg_namespace n ON n\.oid = c\.relnamespace WHERE c\.relname OPERATOR\(pg_catalog\.\~\) '\^\(([^)]+)\)\$' COLLATE pg_catalog\.default AND pg_catalog\.pg_table_is_visible\(c\.oid\) ORDER BY 2, 3;$`)
+
+	if matches := dPattern.FindStringSubmatch(normalized); matches != nil {
+		tableName := matches[1]
+		return fmt.Sprintf("\\d %s", tableName), fmt.Sprintf("show columns from %s;", tableName), true
+	}
+
+	// Check for \d <schema.table> command pattern (with schema)
+	dSchemaPattern := regexp.MustCompile(`^SELECT c\.oid, n\.nspname, c\.relname FROM pg_catalog\.pg_class c LEFT JOIN pg_catalog\.pg_namespace n ON n\.oid = c\.relnamespace WHERE c\.relname OPERATOR\(pg_catalog\.\~\) '\^\(([^)]+)\)\$' COLLATE pg_catalog\.default AND n\.nspname OPERATOR\(pg_catalog\.\~\) '\^\(([^)]+)\)\$' COLLATE pg_catalog\.default ORDER BY 2, 3;$`)
+
+	if matches := dSchemaPattern.FindStringSubmatch(normalized); matches != nil {
+		tableName := matches[1]
+		schemaName := matches[2]
+		return fmt.Sprintf("\\d %s.%s", schemaName, tableName), fmt.Sprintf("show columns from %s.%s;", schemaName, tableName), true
+	}
+
+	return "", "", false
 }
 
 func executeQuery(sql string, token string) (io.ReadCloser, error) {
@@ -245,6 +278,18 @@ func (s *PostgreServer) terminateConn(ctx context.Context) error {
 // wireHandler processes incoming SQL queries
 func (s *PostgreServer) wireHandler(ctx context.Context, query string) (wire.PreparedStatements, error) {
 	s.logger.Printf("incoming SQL query: %s", query)
+
+	detectedCommand, suggestedQuery, isPsqlCommand := DetectPsqlCommandQuery(query)
+	if isPsqlCommand {
+		s.logger.Printf("detected psql command %s, suggesting alternative: %s", detectedCommand, suggestedQuery)
+		return nil, psqlerr.WithSeverity(
+			psqlerr.WithCode(
+				fmt.Errorf("psql commands are not supported. Detected trying to use: %s. Please run instead:\n\n%s", detectedCommand, suggestedQuery),
+				codes.FeatureNotSupported,
+			),
+			psqlerr.LevelError,
+		)
+	}
 
 	readToken := ctx.Value(readTokenCtxKey{}).(string)
 	respBody, err := executeQuery(query, readToken)
