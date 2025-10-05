@@ -7,4 +7,7 @@ require (
 	github.com/lib/pq v1.10.9
 )
 
-require github.com/jackc/pgx/v5 v5.5.4 // indirect
+require (
+	github.com/jackc/pgx/v5 v5.5.4 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
+)

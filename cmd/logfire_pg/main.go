@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -14,7 +13,10 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
 	"github.com/lib/pq/oid"
+	flag "github.com/spf13/pflag"
 )
+
+var version = "dev"
 
 var baseURL = "https://logfire-us.pydantic.dev"
 var queryUrl = baseURL + "/v1/query"
@@ -39,8 +41,23 @@ type readTokenCtxKey struct{}
 
 func main() {
 	var port int
+	var showVersion bool
+	var showHelp bool
+
 	flag.IntVar(&port, "port", 5432, "Port to listen on")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.BoolVar(&showHelp, "help", false, "Print this help message and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("logfire_pg %s\n", version)
+		os.Exit(0)
+	}
+
+	if showHelp {
+		flag.Usage()
+		os.Exit(0)
+	}
 
 	logger := log.New(os.Stdout, "[psql-wire] ", log.LstdFlags)
 	server, err := NewPostgreServer(logger)
